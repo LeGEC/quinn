@@ -182,26 +182,26 @@ impl Pair {
     fn drive_client(&mut self) {
         trace!(self.log, "client running");
         self.client.drive(&self.log, self.time, self.server.addr);
-        for packet in self.client.outbound.drain(..) {
+        for (ecn, packet) in self.client.outbound.drain(..) {
             if let Some(ref socket) = self.client.socket {
                 socket.send_to(&packet, self.server.addr).unwrap();
             }
             self.server
                 .inbound
-                .push_back((self.time + self.latency, packet));
+                .push_back((self.time + self.latency, ecn, packet));
         }
     }
 
     fn drive_server(&mut self) {
         trace!(self.log, "server running");
         self.server.drive(&self.log, self.time, self.client.addr);
-        for packet in self.server.outbound.drain(..) {
+        for (ecn, packet) in self.server.outbound.drain(..) {
             if let Some(ref socket) = self.server.socket {
                 socket.send_to(&packet, self.client.addr).unwrap();
             }
             self.client
                 .inbound
-                .push_back((self.time + self.latency, packet));
+                .push_back((self.time + self.latency, ecn, packet));
         }
     }
 
@@ -231,8 +231,8 @@ struct TestEndpoint {
     loss: u64,
     close: u64,
     conn: Option<ConnectionHandle>,
-    outbound: VecDeque<Box<[u8]>>,
-    inbound: VecDeque<(u64, Box<[u8]>)>,
+    outbound: VecDeque<(Option<EcnCodepoint>, Box<[u8]>)>,
+    inbound: VecDeque<(u64, Option<EcnCodepoint>, Box<[u8]>)>,
 }
 
 impl TestEndpoint {
@@ -302,16 +302,14 @@ impl TestEndpoint {
             }
         }
         while self.inbound.front().map_or(false, |x| x.0 <= now) {
-            self.endpoint.handle(
-                now,
-                remote,
-                Vec::from(self.inbound.pop_front().unwrap().1).into(),
-            );
+            let (_, ecn, packet) = self.inbound.pop_front().unwrap();
+            self.endpoint
+                .handle(now, remote, ecn, Vec::from(packet).into());
         }
         while let Some(x) = self.endpoint.poll_io(now) {
             match x {
-                Io::Transmit { packet, .. } => {
-                    self.outbound.push_back(packet);
+                Io::Transmit { packet, ecn, .. } => {
+                    self.outbound.push_back((ecn, packet));
                 }
                 Io::TimerStart {
                     timer,
@@ -395,6 +393,7 @@ fn version_negotiate() {
     server.handle(
         0,
         client_addr,
+        None,
         // Long-header packet with reserved version number
         hex!(
             "80 0a1a2a3a
@@ -419,8 +418,10 @@ fn version_negotiate() {
 #[test]
 fn lifecycle() {
     let mut pair = Pair::default();
-    let (client_conn, _) = pair.connect();
+    let (client_conn, server_conn) = pair.connect();
     assert_matches!(pair.client.poll(), None);
+    assert!(pair.client.connection(client_conn).using_ecn());
+    assert!(pair.server.connection(server_conn).using_ecn());
 
     const REASON: &[u8] = b"whee";
     info!(pair.log, "closing");

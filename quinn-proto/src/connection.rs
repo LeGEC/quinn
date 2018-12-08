@@ -12,8 +12,8 @@ use crate::crypto::{self, Crypto, TlsSession, ACK_DELAY_EXPONENT};
 use crate::dedup::Dedup;
 use crate::endpoint::{Config, Event, Timer};
 use crate::packet::{
-    set_payload_length, ConnectionId, Header, LongType, Packet, PacketNumber, PartialDecode,
-    AEAD_TAG_SIZE,
+    set_payload_length, ConnectionId, EcnCodepoint, Header, LongType, Packet, PacketNumber,
+    PartialDecode, AEAD_TAG_SIZE,
 };
 use crate::range_set::RangeSet;
 use crate::stream::{self, ReadError, Stream, WriteError};
@@ -118,12 +118,22 @@ pub struct Connection {
     bytes_in_flight: u64,
     /// Maximum number of bytes in flight that may be sent.
     congestion_window: u64,
-    /// The largest packet number sent when QUIC detects a loss. When a larger packet is
-    /// acknowledged, QUIC exits recovery.
-    end_of_recovery: u64,
+    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
+    /// after this time is acknowledged, QUIC exits recovery.
+    recovery_start_time: u64,
     /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
     /// slow start and the window grows by the number of bytes acknowledged.
     ssthresh: u64,
+    /// Explicit congestion notification (ECN) counters.
+    ecn_counters: frame::EcnCounts,
+    /// Recent ECN counters sent by the peer in ACK frames.
+    ///
+    /// Updated (and inspected) whenever we receive an ACK with a new highest acked packet number.
+    ecn_feedback: frame::EcnCounts,
+    /// ECN codepoint set on outgoing packets
+    sending_ecn: bool,
+    /// Whether the most recently received packet had an ECN codepoint set.
+    receiving_ecn: bool,
 
     //
     // Handshake retransmit state
@@ -236,8 +246,12 @@ impl Connection {
 
             bytes_in_flight: 0,
             congestion_window: config.initial_window,
-            end_of_recovery: 0,
+            recovery_start_time: 0,
             ssthresh: u64::max_value(),
+            ecn_counters: frame::EcnCounts::ZERO,
+            ecn_feedback: frame::EcnCounts::ZERO,
+            sending_ecn: true,
+            receiving_ecn: false,
 
             awaiting_handshake: false,
             handshake_pending: Retransmits::default(),
@@ -311,24 +325,26 @@ impl Connection {
 
     fn on_ack_received(&mut self, mux: &mut impl Multiplexer, now: u64, ack: frame::Ack) {
         trace!(self.log, "got ack"; "ranges" => ?ack.iter().collect::<Vec<_>>());
+
         let was_blocked = self.blocked();
-        // TODO: Validate
-        self.largest_acked_packet = cmp::max(self.largest_acked_packet, ack.largest);
+
+        let largest_sent_time = self.sent_packets.get(&ack.largest).map(|x| x.time);
+        let prev_largest = self.largest_acked_packet;
+        // TODO: Validate - draft is unclear about when this should be updated
+        self.largest_acked_packet = cmp::max(ack.largest, self.largest_acked_packet);
+
         if let Some(info) = self.sent_packets.get(&ack.largest).cloned() {
             self.latest_rtt = now - info.time;
             let delay = ack.delay << self.params.ack_delay_exponent;
             self.update_rtt(delay, info.ack_only());
         }
-        for range in &ack {
-            // Avoid DoS from unreasonably huge ack ranges
-            let packets = self
-                .sent_packets
-                .range(range)
-                .map(|(&n, _)| n)
-                .collect::<Vec<_>>();
-            for packet in packets {
-                self.on_packet_acked(packet);
-            }
+        // Avoid DoS from unreasonably huge ack ranges
+        let newly_acked = ack
+            .iter()
+            .flat_map(|range| self.sent_packets.range(range).map(|(&n, _)| n))
+            .collect::<Vec<_>>();
+        for &packet in &newly_acked {
+            self.on_packet_acked(packet);
         }
         self.detect_lost_packets(now, ack.largest);
         self.set_loss_detection_alarm(mux);
@@ -337,6 +353,74 @@ impl Connection {
                 mux.emit(Event::StreamWritable { stream });
             }
         }
+
+        // Explicit congestion notification
+        if self.sending_ecn {
+            if let Some(ecn) = ack.ecn {
+                // We only examine ECN counters from ACKs that we are certain we received in transmit
+                // order, allowing us to compute an increase in ECN counts to compare against the number
+                // of newly acked packets that remains well-defined in the presence of arbitrary packet
+                // reordering.
+                if ack.largest > prev_largest {
+                    match self.detect_ecn(newly_acked.len() as u64, ecn) {
+                        Err(e) => {
+                            debug!(
+                                self.log,
+                                "halting ECN due to verification failure: {error}",
+                                error = e
+                            );
+                            self.sending_ecn = false;
+                        }
+                        Ok(false) => {}
+                        Ok(true) => {
+                            // This should always be `Some(_)` because a new largest ack is by
+                            // definition newly acked, but our remaining draft-11 handshake hacks
+                            // violate that. Replace with unwrap when our handshake is updated.
+                            if let Some(time) = largest_sent_time {
+                                self.congestion_event(now, time);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
+                debug!(self.log, "ECN not acknowledged by peer");
+                self.sending_ecn = false;
+            }
+        }
+    }
+
+    /// Verifies an ACK ECN block and, if valid, returns whether congestion was encountered.
+    fn detect_ecn(
+        &mut self,
+        newly_acked: u64,
+        ecn: frame::EcnCounts,
+    ) -> Result<bool, &'static str> {
+        let ect0_increase = ecn
+            .ect0
+            .checked_sub(self.ecn_feedback.ect0)
+            .ok_or("peer ECT(0) count regression")?;
+        let ect1_increase = ecn
+            .ect1
+            .checked_sub(self.ecn_feedback.ect1)
+            .ok_or("peer ECT(1) count regression")?;
+        let ce_increase = ecn
+            .ce
+            .checked_sub(self.ecn_feedback.ce)
+            .ok_or("peer CE count regression")?;
+        let total_increase = ect0_increase + ect1_increase + ce_increase;
+        if total_increase < newly_acked {
+            return Err("ECN bleaching");
+        }
+        if (ect0_increase + ce_increase) < newly_acked || ect1_increase != 0 {
+            return Err("ECN corruption");
+        }
+        // If total_increase > newly_acked (which happens when ACKs are lost), this is required by
+        // the draft so that long-term drift does not occur. If =, then the only question is whether
+        // to count CE packets as CE or ECT0. Recording them as CE is more consistent and keeps the
+        // congestion check obvious.
+        self.ecn_feedback = ecn;
+        Ok(ce_increase != 0)
     }
 
     fn update_rtt(&mut self, ack_delay: u64, ack_only: bool) {
@@ -501,6 +585,7 @@ impl Connection {
 
         if let Some(largest_lost) = lost_packets.last().cloned() {
             let old_bytes_in_flight = self.bytes_in_flight;
+            let largest_lost_time = self.sent_packets.get(&largest_lost).unwrap().time;
             for packet in lost_packets {
                 let info = self.sent_packets.remove(&packet).unwrap();
                 if info.handshake {
@@ -512,22 +597,27 @@ impl Connection {
             }
             // Don't apply congestion penalty for lost ack-only packets
             let lost_nonack = old_bytes_in_flight != self.bytes_in_flight;
-            // Start a new recovery epoch if the lost packet is larger than the end of the
-            // previous recovery epoch.
-            if lost_nonack && !self.in_recovery(largest_lost) {
-                self.end_of_recovery = self.largest_sent_packet();
-                // *= factor
-                self.congestion_window =
-                    (self.congestion_window * self.config.loss_reduction_factor as u64) >> 16;
-                self.congestion_window =
-                    cmp::max(self.congestion_window, self.config.minimum_window);
-                self.ssthresh = self.congestion_window;
+            if lost_nonack {
+                self.congestion_event(now, largest_lost_time)
             }
         }
     }
 
-    fn in_recovery(&self, packet: u64) -> bool {
-        packet <= self.end_of_recovery
+    fn congestion_event(&mut self, now: u64, sent_time: u64) {
+        // Start a new recovery epoch if the lost packet is larger than the end of the
+        // previous recovery epoch.
+        if !self.in_recovery(sent_time) {
+            self.recovery_start_time = now;
+            // *= factor
+            self.congestion_window =
+                (self.congestion_window * self.config.loss_reduction_factor as u64) >> 16;
+            self.congestion_window = cmp::max(self.congestion_window, self.config.minimum_window);
+            self.ssthresh = self.congestion_window;
+        }
+    }
+
+    fn in_recovery(&self, sent_time: u64) -> bool {
+        sent_time <= self.recovery_start_time
     }
 
     fn set_loss_detection_alarm(&mut self, mux: &mut impl Multiplexer) {
@@ -587,22 +677,25 @@ impl Connection {
         &mut self,
         mux: &mut impl Multiplexer,
         now: u64,
+        ecn: Option<EcnCodepoint>,
         packet: Option<u64>,
     ) {
         self.reset_idle_timeout(mux, now);
-        let packet = if let Some(x) = packet {
-            x
-        } else {
-            return;
-        };
-        trace!(self.log, "packet authenticated"; "pn" => packet);
-        self.pending_acks.insert_one(packet);
-        if self.pending_acks.len() > MAX_ACK_BLOCKS {
-            self.pending_acks.pop_min();
+        self.receiving_ecn |= ecn.is_some();
+        if let Some(x) = ecn {
+            self.ecn_counters += x;
         }
-        if packet > self.rx_packet {
-            self.rx_packet = packet;
-            self.rx_packet_time = now;
+
+        if let Some(packet) = packet {
+            trace!(self.log, "packet {packet} authenticated", packet = packet);
+            self.pending_acks.insert_one(packet);
+            if self.pending_acks.len() > MAX_ACK_BLOCKS {
+                self.pending_acks.pop_min();
+            }
+            if packet > self.rx_packet {
+                self.rx_packet = packet;
+                self.rx_packet_time = now;
+            }
         }
     }
 
@@ -683,6 +776,7 @@ impl Connection {
         &mut self,
         mux: &mut impl Multiplexer,
         now: u64,
+        ecn: Option<EcnCodepoint>,
         packet_number: u64,
         payload: Bytes,
     ) -> Result<(), TransportError> {
@@ -699,7 +793,7 @@ impl Connection {
             &mut io::Cursor::new(self.tls.get_quic_transport_parameters().unwrap()),
         )?;
         self.set_params(params)?;
-        self.on_packet_authenticated(mux, now, Some(packet_number));
+        self.on_packet_authenticated(mux, now, ecn, Some(packet_number));
         self.write_tls();
         Ok(())
     }
@@ -740,6 +834,7 @@ impl Connection {
         mux: &mut impl Multiplexer,
         now: u64,
         remote: SocketAddrV6,
+        ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
     ) -> Option<BytesMut> {
         let mut new_crypto = None;
@@ -762,7 +857,7 @@ impl Connection {
 
         match partial_decode.finish(crypto.pn_decrypt_key()) {
             Ok((packet, rest)) => {
-                self.handle_packet(mux, now, remote, packet, new_crypto);
+                self.handle_packet(mux, now, remote, ecn, packet, new_crypto);
                 rest
             }
             Err(e) => {
@@ -777,6 +872,7 @@ impl Connection {
         mux: &mut impl Multiplexer,
         now: u64,
         remote: SocketAddrV6,
+        ecn: Option<EcnCodepoint>,
         mut packet: Packet,
         crypto_update: Option<Crypto>,
     ) {
@@ -819,7 +915,7 @@ impl Connection {
                     }
                 }
                 if !was_closed {
-                    self.on_packet_authenticated(mux, now, number);
+                    self.on_packet_authenticated(mux, now, ecn, number);
                 }
                 self.handle_connected_inner(mux, now, number, packet)
             }
@@ -1463,8 +1559,13 @@ impl Connection {
         let acks = if !self.pending_acks.is_empty() {
             //&& !crypto.is_0rtt() {
             let delay = (now - self.rx_packet_time) >> ACK_DELAY_EXPONENT;
-            frame::Ack::encode(delay, &self.pending_acks, None, &mut buf);
             trace!(self.log, "ACK"; "ranges" => ?self.pending_acks.iter().collect::<Vec<_>>(), "delay" => delay);
+            let ecn = if self.receiving_ecn {
+                Some(self.ecn_counters)
+            } else {
+                None
+            };
+            frame::Ack::encode(delay, &self.pending_acks, ecn, &mut buf);
             self.pending_acks.clone()
         } else {
             RangeSet::new()
@@ -1680,7 +1781,15 @@ impl Connection {
 
     /// Send a QUIC packet
     fn transmit(&mut self, mux: &mut impl Multiplexer, now: u64, packet: Box<[u8]>) {
-        mux.transmit(self.remote, packet);
+        mux.transmit(
+            self.remote,
+            if self.sending_ecn {
+                Some(EcnCodepoint::ECT0)
+            } else {
+                None
+            },
+            packet,
+        );
         self.reset_idle_timeout(mux, now);
     }
 
@@ -2065,7 +2174,15 @@ impl Connection {
     pub fn flush_pending(&mut self, mux: &mut impl Multiplexer, now: u64) {
         let mut sent = false;
         while let Some(packet) = self.next_packet(mux, now) {
-            mux.transmit(self.remote, packet.into());
+            mux.transmit(
+                self.remote,
+                if self.sending_ecn {
+                    Some(EcnCodepoint::ECT0)
+                } else {
+                    None
+                },
+                packet.into(),
+            );
             sent = true;
         }
         if sent {
@@ -2121,6 +2238,11 @@ impl Connection {
     /// Whether a previous session was successfully resumed by this connection
     pub fn session_resumed(&self) -> bool {
         false // TODO: fixme?
+    }
+
+    /// Whether explicit congestion notification is in use on outgoing packets.
+    pub fn using_ecn(&self) -> bool {
+        self.sending_ecn
     }
 }
 
@@ -2521,7 +2643,7 @@ const MAX_ACK_BLOCKS: usize = 64;
 
 pub trait Multiplexer {
     /// Transmit a UDP packet.
-    fn transmit(&mut self, destination: SocketAddrV6, packet: Box<[u8]>);
+    fn transmit(&mut self, destination: SocketAddrV6, ecn: Option<EcnCodepoint>, packet: Box<[u8]>);
     /// Start or reset a timer associated with this connection.
     fn timer_start(&mut self, timer: Timer, time: u64);
     /// Start one of the timers associated with this connection.
