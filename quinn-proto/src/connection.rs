@@ -778,20 +778,6 @@ impl Connection {
         mut packet: Packet,
         crypto_update: Option<Crypto>,
     ) {
-        if let Some(token) = self.params.stateless_reset_token {
-            if packet.payload.len() >= 16 && packet.payload[packet.payload.len() - 16..] == token {
-                if !self.state.is_drained() {
-                    debug!(self.log, "got stateless reset");
-                    mux.timer_stop(Timer::LossDetection);
-                    mux.timer_stop(Timer::Close);
-                    mux.timer_stop(Timer::Idle);
-                    mux.emit(ConnectionError::Reset.into());
-                    self.state = State::Drained;
-                }
-                return;
-            }
-        }
-
         trace!(self.log, "connection got packet"; "len" => packet.payload.len());
         let was_handshake = self.is_handshaking();
         let was_closed = self.state.is_closed();
@@ -803,11 +789,20 @@ impl Connection {
             }
             Err(None) => {
                 debug!(self.log, "failed to authenticate packet");
-                return;
+                if self.check_for_stateless_reset(mux, &packet) {
+                    Err(ConnectionError::Reset)
+                } else {
+                    return;
+                }
             }
             Ok(number) => {
-                if let Some(number) = number {
-                    if self.dedup.insert(number) {
+                let duplicate =
+                    number.and_then(|n| if self.dedup.insert(n) { Some(n) } else { None });
+
+                if let Some(number) = duplicate {
+                    if self.check_for_stateless_reset(mux, &packet) {
+                        Err(ConnectionError::Reset)
+                    } else {
                         warn!(
                             self.log,
                             "discarding possible duplicate packet {packet}",
@@ -815,11 +810,12 @@ impl Connection {
                         );
                         return;
                     }
+                } else {
+                    if !was_closed {
+                        self.on_packet_authenticated(mux, now, number);
+                    }
+                    self.handle_connected_inner(mux, now, number, packet)
                 }
-                if !was_closed {
-                    self.on_packet_authenticated(mux, now, number);
-                }
-                self.handle_connected_inner(mux, now, number, packet)
             }
         };
 
@@ -831,7 +827,7 @@ impl Connection {
                 ConnectionError::ConnectionClosed { reason } => State::closed(reason),
                 ConnectionError::Reset => {
                     debug!(self.log, "unexpected connection reset error received"; "err" => %conn_err, "initial_conn_id" => %self.init_cid);
-                    panic!("unexpected connection reset error received");
+                    State::Drained
                 }
                 ConnectionError::TimedOut => {
                     debug!(self.log, "unexpected connection timed out error received"; "err" => %conn_err, "initial_conn_id" => %self.init_cid);
@@ -850,6 +846,21 @@ impl Connection {
         if let State::Closed(ref state) = self.state {
             self.transmit_close(mux, now, &state.clone().reason);
         }
+    }
+
+    fn check_for_stateless_reset(&mut self, mux: &mut impl Multiplexer, packet: &Packet) -> bool {
+        if let Some(token) = self.params.stateless_reset_token {
+            if packet.payload.len() >= 16 && packet.payload[packet.payload.len() - 16..] == token {
+                if !self.state.is_drained() {
+                    debug!(self.log, "got stateless reset");
+                    mux.timer_stop(Timer::LossDetection);
+                    mux.timer_stop(Timer::Close);
+                    mux.timer_stop(Timer::Idle);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn handle_connected_inner(
