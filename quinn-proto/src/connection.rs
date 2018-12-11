@@ -739,7 +739,6 @@ impl Connection {
         &mut self,
         mux: &mut impl Multiplexer,
         now: u64,
-        remote: SocketAddrV6,
         partial_decode: PartialDecode,
     ) -> Option<BytesMut> {
         let mut new_crypto = None;
@@ -762,7 +761,7 @@ impl Connection {
 
         match partial_decode.finish(crypto.pn_decrypt_key()) {
             Ok((packet, rest)) => {
-                self.handle_packet(mux, now, remote, packet, new_crypto);
+                self.handle_packet(mux, now, packet, new_crypto);
                 rest
             }
             Err(e) => {
@@ -776,7 +775,6 @@ impl Connection {
         &mut self,
         mux: &mut impl Multiplexer,
         now: u64,
-        remote: SocketAddrV6,
         mut packet: Packet,
         crypto_update: Option<Crypto>,
     ) {
