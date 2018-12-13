@@ -41,8 +41,7 @@ pub struct Connection {
     rx_packet: u64,
     /// Time at which the above was received
     rx_packet_time: u64,
-    crypto: Option<Crypto>,
-    prev_crypto: Option<(u64, Crypto)>,
+    cryptos: VecDeque<(CryptoLevel, u64, Crypto)>,
     //zero_rtt_crypto: Option<Crypto>,
     key_phase: bool,
     params: TransportParameters,
@@ -133,7 +132,6 @@ pub struct Connection {
     /// has advanced their handshake state machine.
     awaiting_handshake: bool,
     handshake_pending: Retransmits,
-    handshake_crypto: Crypto,
 
     //
     // Transmit queue
@@ -165,7 +163,13 @@ impl Connection {
         } else {
             Side::Server
         };
-        let handshake_crypto = Crypto::new_initial(&init_cid, side);
+
+        let mut cryptos = VecDeque::with_capacity(4);
+        cryptos.push_back((
+            CryptoLevel::Initial,
+            0,
+            Crypto::new_initial(&init_cid, side),
+        ));
         let mut streams = FnvHashMap::default();
         for i in 0..config.max_remote_uni_streams {
             streams.insert(
@@ -197,8 +201,7 @@ impl Connection {
             mtu: MIN_MTU,
             rx_packet: 0,
             rx_packet_time: 0,
-            crypto: None,
-            prev_crypto: None,
+            cryptos,
             //zero_rtt_crypto: None,
             key_phase: false,
             params: TransportParameters::new(&config),
@@ -241,7 +244,6 @@ impl Connection {
 
             awaiting_handshake: false,
             handshake_pending: Retransmits::default(),
-            handshake_crypto,
 
             pending: Retransmits::default(),
             pending_acks: RangeSet::new(),
@@ -744,13 +746,13 @@ impl Connection {
     ) -> Option<BytesMut> {
         let mut new_crypto = None;
         let crypto = if partial_decode.is_handshake() {
-            &self.handshake_crypto
+            self.find_crypto(CryptoLevel::Initial, 0).unwrap()
         } else if partial_decode.key_phase() != self.key_phase {
-            new_crypto = Some(self.crypto.as_ref().unwrap().update());
+            new_crypto = Some(self.cryptos.back().unwrap().2.update());
             new_crypto.as_ref().unwrap()
         } else {
-            if let Some(ref crypto) = self.crypto {
-                crypto
+            if let Some(crypto) = self.cryptos.back() {
+                &crypto.2
             } else {
                 warn!(
                     self.log,
@@ -890,7 +892,8 @@ impl Connection {
                         )
                         .unwrap();
                         self.crypto_offset = 0;
-                        self.handshake_crypto = Crypto::new_initial(&rem_cid, self.side);
+                        let new_crypto = Crypto::new_initial(&rem_cid, self.side);
+                        mem::replace(&mut self.cryptos.get_mut(0).unwrap().2, new_crypto);
                         self.write_tls();
 
                         self.state = State::Handshake(state::Handshake {
@@ -986,7 +989,11 @@ impl Connection {
                         if self.side.is_server() {
                             self.awaiting_handshake = false;
                         }
-                        self.crypto = Some(Crypto::new_1rtt(&self.tls, self.side));
+                        self.cryptos.push_back((
+                            CryptoLevel::OneRtt,
+                            0,
+                            Crypto::new_1rtt(&self.tls, self.side),
+                        ));
                         mux.emit(Event::Connected {
                             protocol: self.tls.get_alpn_protocol().map(|x| x.into()),
                         });
@@ -1400,7 +1407,7 @@ impl Connection {
             (
                 number,
                 header,
-                &self.handshake_crypto,
+                &self.cryptos.front().unwrap().2,
                 &mut self.handshake_pending,
                 CryptoLevel::Initial,
             )
@@ -1435,7 +1442,7 @@ impl Connection {
             (
                 number,
                 header,
-                self.crypto.as_ref().unwrap(),
+                &self.cryptos.back().unwrap().2,
                 &mut self.pending,
                 CryptoLevel::OneRtt,
             )
@@ -1697,7 +1704,7 @@ impl Connection {
         let header_len = buf.len() as u16;
         buf.write(frame::Type::PING);
 
-        let crypto = self.crypto.as_ref().unwrap();
+        let crypto = &self.cryptos.back().unwrap().2;
         crypto.encrypt(number, &mut buf, header_len as usize);
         partial_encode.finish(&mut buf, crypto.pn_encrypt_key(), header_len as usize);
 
@@ -1725,19 +1732,19 @@ impl Connection {
         let full_number = self.get_tx_number();
         let number = PacketNumber::new(full_number, self.largest_acked_packet);
         let mut buf = Vec::new();
-        let header = if self.crypto.is_some() {
-            Header::Short {
+        let crypto_meta = self.cryptos.back().unwrap();
+        let header = match crypto_meta.0 {
+            CryptoLevel::OneRtt => Header::Short {
                 dst_cid: self.rem_cid,
                 number,
                 key_phase: self.key_phase,
-            }
-        } else {
-            Header::Long {
+            },
+            CryptoLevel::Initial => Header::Long {
                 ty: LongType::Handshake,
                 dst_cid: self.rem_cid,
                 src_cid: self.loc_cid,
                 number,
-            }
+            },
         };
         let partial_encode = header.encode(&mut buf);
         let header_len = buf.len() as u16;
@@ -1752,12 +1759,14 @@ impl Connection {
             set_payload_length(&mut buf, header_len as usize, number.len());
         }
 
-        let crypto = self
-            .crypto
-            .as_ref()
-            .unwrap_or_else(|| &self.handshake_crypto);
-        crypto.encrypt(full_number, &mut buf, header_len as usize);
-        partial_encode.finish(&mut buf, crypto.pn_encrypt_key(), header_len as usize);
+        crypto_meta
+            .2
+            .encrypt(full_number, &mut buf, header_len as usize);
+        partial_encode.finish(
+            &mut buf,
+            crypto_meta.2.pn_encrypt_key(),
+            header_len as usize,
+        );
         self.transmit(mux, now, buf.into());
     }
 
@@ -1977,21 +1986,23 @@ impl Connection {
             // Retry packets are not encrypted and have no packet number
             return Ok(None);
         }
-        let number = match packet.header {
-            Header::Short { number, .. } if !handshake => number,
-            Header::Initial { number, .. } | Header::Long { number, .. } if handshake => number,
+        let (level, number) = match packet.header {
+            Header::Short { number, .. } if !handshake => (CryptoLevel::OneRtt, number),
+            Header::Initial { number, .. } | Header::Long { number, .. } if handshake => {
+                (CryptoLevel::Initial, number)
+            }
             _ => {
                 return Err(None);
             }
         };
         let number = number.expand(self.rx_packet + 1);
 
-        let crypto = match (handshake, &crypto_update, &self.prev_crypto) {
-            (true, None, _) => &self.handshake_crypto,
-            (true, Some(_), _) => unreachable!(),
-            (false, Some(crypto), _) => crypto,
-            (false, _, &Some((boundary, ref prev))) if number < boundary => prev,
-            _ => self.crypto.as_ref().unwrap(),
+        let crypto = match crypto_update.as_ref() {
+            None => self.find_crypto(level, number).unwrap(),
+            Some(crypto) => {
+                assert_eq!(level, CryptoLevel::OneRtt);
+                crypto
+            }
         };
 
         crypto
@@ -2003,10 +2014,7 @@ impl Connection {
                 warn!(self.log, "recieved an illegal key update");
                 return Err(Some(TransportError::PROTOCOL_VIOLATION));
             }
-
-            let old = mem::replace(self.crypto.as_mut().unwrap(), crypto);
-            self.prev_crypto = Some((number, old));
-            self.key_phase = !self.key_phase;
+            self.push_crypto(crypto, number);
         }
 
         Ok(Some(number))
@@ -2014,10 +2022,10 @@ impl Connection {
 
     #[cfg(test)]
     pub fn update_keys(&mut self) {
-        let new = self.crypto.as_ref().unwrap().update();
-        let old = mem::replace(self.crypto.as_mut().unwrap(), new);
-        self.prev_crypto = Some((self.next_packet_number, old));
-        self.key_phase = !self.key_phase;
+        self.push_crypto(
+            self.cryptos.back().unwrap().2.update(),
+            self.next_packet_number,
+        );
     }
 
     pub fn write(&mut self, stream: StreamId, data: &[u8]) -> Result<usize, WriteError> {
@@ -2073,6 +2081,28 @@ impl Connection {
         }
     }
 
+    fn push_crypto(&mut self, crypto: Crypto, number: u64) {
+        let old_idx = self
+            .cryptos
+            .iter()
+            .position(|(level, _, _)| level == &CryptoLevel::OneRtt)
+            .unwrap();
+        self.cryptos.remove(old_idx);
+        self.cryptos
+            .push_back((CryptoLevel::OneRtt, number, crypto));
+        self.key_phase = !self.key_phase;
+    }
+
+    fn find_crypto(&self, level: CryptoLevel, number: u64) -> Option<&Crypto> {
+        self.cryptos.iter().rev().find_map(|(l, s, crypto)| {
+            if l == &level && s <= &number {
+                Some(crypto)
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn is_handshaking(&self) -> bool {
         self.state.is_handshake()
     }
@@ -2124,7 +2154,7 @@ impl Connection {
     }
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum CryptoLevel {
     Initial,
     OneRtt,
