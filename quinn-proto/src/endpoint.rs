@@ -531,13 +531,14 @@ impl Endpoint {
         Ok(conn)
     }
 
-    fn handle_initial(&mut self, now: u64, remote: SocketAddrV6, packet: Packet, crypto: &Crypto) {
-        let Packet {
-            header,
-            header_data,
-            mut payload,
-        } = packet;
-        let (src_cid, dst_cid, token, packet_number) = match header {
+    fn handle_initial(
+        &mut self,
+        now: u64,
+        remote: SocketAddrV6,
+        mut packet: Packet,
+        crypto: &Crypto,
+    ) {
+        let (src_cid, dst_cid, token, packet_number) = match packet.header {
             Header::Initial {
                 src_cid,
                 dst_cid,
@@ -549,7 +550,11 @@ impl Endpoint {
         let packet_number = packet_number.expand(0);
 
         if crypto
-            .decrypt(packet_number as u64, &header_data, &mut payload)
+            .decrypt(
+                packet_number as u64,
+                &packet.header_data,
+                &mut packet.payload,
+            )
             .is_err()
         {
             debug!(self.log, "failed to authenticate initial packet");
@@ -637,7 +642,7 @@ impl Endpoint {
             &mut mux,
             now,
             packet_number as u64,
-            payload.freeze(),
+            packet.payload.freeze(),
         ) {
             Ok(()) => {
                 self.incoming_handshakes += 1;
