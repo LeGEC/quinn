@@ -457,15 +457,13 @@ fn server_stateless_reset() {
 
     let server = Config {
         reset_key,
-        max_remote_uni_streams: 32,
-        max_remote_bi_streams: 32,
         ..Config::default()
     };
 
     let mut pair = Pair::new(server, Config::default(), server_config());
     let (client_conn, _) = pair.connect();
     pair.server.endpoint = Endpoint::new(
-        pair.log.new(o!("peer" => "server")),
+        pair.log.new(o!("side" => "Server")),
         Config {
             reset_key: reset_key_2,
             ..Config::default()

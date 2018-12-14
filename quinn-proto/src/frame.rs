@@ -114,38 +114,21 @@ pub enum Frame {
     ConnectionClose(ConnectionClose),
     ApplicationClose(ApplicationClose),
     MaxData(u64),
-    MaxStreamData {
-        id: StreamId,
-        offset: u64,
-    },
+    MaxStreamData { id: StreamId, offset: u64 },
     MaxStreamId(StreamId),
     Ping,
-    Blocked {
-        offset: u64,
-    },
-    StreamBlocked {
-        id: StreamId,
-        offset: u64,
-    },
-    StreamIdBlocked {
-        id: StreamId,
-    },
-    StopSending {
-        id: StreamId,
-        error_code: u16,
-    },
-    RetireConnectionId {
-        sequence: u64,
-    },
+    Blocked { offset: u64 },
+    StreamBlocked { id: StreamId, offset: u64 },
+    StreamIdBlocked { id: StreamId },
+    StopSending { id: StreamId, error_code: u16 },
+    RetireConnectionId { sequence: u64 },
     Ack(Ack),
     Stream(Stream),
     PathChallenge(u64),
     PathResponse(u64),
     NewConnectionId(NewConnectionId),
     Crypto(Crypto),
-    NewToken {
-        token: Bytes,
-    },
+    NewToken { token: Bytes },
     Invalid(Type),
     Illegal(Type),
 }
