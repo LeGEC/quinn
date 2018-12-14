@@ -1,4 +1,4 @@
-use std::collections::{hash_map, BTreeMap, VecDeque};
+use std::collections::{hash_map, BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddrV6;
 use std::sync::Arc;
 use std::{cmp, io, mem};
@@ -8,7 +8,7 @@ use fnv::{FnvHashMap, FnvHashSet};
 use slog::Logger;
 
 use crate::coding::{BufExt, BufMutExt};
-use crate::crypto::{self, Crypto, TlsSession, ACK_DELAY_EXPONENT};
+use crate::crypto::{self, reset_token_for, Crypto, TlsSession, ACK_DELAY_EXPONENT};
 use crate::dedup::Dedup;
 use crate::endpoint::{Config, Event, Timer};
 use crate::packet::{
@@ -31,8 +31,9 @@ pub struct Connection {
     pub(crate) app_closed: bool,
     /// DCID of Initial packet
     pub(crate) init_cid: ConnectionId,
-    loc_cid: ConnectionId,
+    loc_cids: HashMap<u64, ConnectionId>,
     rem_cid: ConnectionId,
+    rem_cid_seq: u64,
     pub(crate) remote: SocketAddrV6,
     pub(crate) state: State,
     side: Side,
@@ -63,6 +64,8 @@ pub struct Connection {
     /// ConnectionId sent by this client on the first Initial, if a Retry was received.
     orig_rem_cid: Option<ConnectionId>,
     dedup: Dedup,
+    /// Number of local connection IDs that have been issued in NEW_CONNECTION_ID frames.
+    cids_issued: u64,
 
     //
     // Loss Detection
@@ -179,7 +182,8 @@ impl Connection {
                 Stream::new_bi(config.stream_receive_window as u64),
             );
         }
-
+        let mut loc_cids = HashMap::new();
+        loc_cids.insert(0, loc_cid);
         let state = State::Handshake(state::Handshake {
             rem_cid_set: side.is_server(),
             token: None,
@@ -189,8 +193,9 @@ impl Connection {
             tls,
             app_closed: false,
             init_cid,
-            loc_cid,
+            loc_cids,
             rem_cid,
+            rem_cid_seq: 0,
             remote,
             side,
             state,
@@ -212,6 +217,7 @@ impl Connection {
             crypto_offset: 0,
             orig_rem_cid: None,
             dedup: Dedup::new(),
+            cids_issued: 0,
 
             handshake_count: 0,
             tlp_count: 0,
@@ -988,6 +994,11 @@ impl Connection {
                         if self.side.is_server() {
                             self.awaiting_handshake = false;
                         }
+                        if self.side.is_client() && self.config.local_cid_len != 0 {
+                            // If the server adopts a CID we issue explicitly, we can later issue
+                            // stateless resets to it.
+                            self.issue_cid(mux);
+                        }
                         self.crypto = Some(Crypto::new_1rtt(&self.tls, self.side));
                         mux.emit(Event::Connected {
                             protocol: self.tls.get_alpn_protocol().map(|x| x.into()),
@@ -1117,6 +1128,17 @@ impl Connection {
             }
             State::Draining | State::Drained => Ok(()),
         }
+    }
+
+    fn issue_cid(&mut self, mux: &mut impl Multiplexer) {
+        let cid = mux.new_cid();
+        let token = reset_token_for(&self.config.reset_key, &cid);
+        self.pending.new_cids.push(frame::NewConnectionId {
+            id: cid,
+            sequence: self.cids_issued + 1,
+            reset_token: token,
+        });
+        self.cids_issued += 1;
     }
 
     fn process_payload(
@@ -1323,7 +1345,7 @@ impl Connection {
                         stop_reason: Some(error_code),
                     };
                 }
-                Frame::RetireConnectionId { .. } => {
+                Frame::RetireConnectionId { sequence } => {
                     if self.config.local_cid_len == 0 {
                         debug!(
                             self.log,
@@ -1331,15 +1353,37 @@ impl Connection {
                         );
                         return Err(TransportError::PROTOCOL_VIOLATION);
                     }
-                    // TODO: Forget about this ID and issue a NEW_CONNECTION_ID
-                }
-                Frame::NewConnectionId { .. } => {
-                    if self.rem_cid.is_empty() {
-                        debug!(self.log, "got NEW_CONNECTION_ID for connection {connection} with empty remote ID",
-                               connection=self.loc_cid);
+                    if sequence > self.cids_issued {
+                        debug!(
+                            self.log,
+                            "got RETIRE_CONNECTION_ID for unissued cid sequence number {sequence}",
+                            sequence = sequence,
+                        );
                         return Err(TransportError::PROTOCOL_VIOLATION);
                     }
-                    trace!(self.log, "ignoring NEW_CONNECTION_ID (unimplemented)");
+                    if let Some(old) = self.loc_cids.remove(&sequence) {
+                        mux.retire_cid(&old);
+                        // Ensure the peer has a constant number of CIDs
+                        self.issue_cid(mux);
+                    }
+                }
+                Frame::NewConnectionId(frame) => {
+                    if self.rem_cid.is_empty() {
+                        debug!(
+                            self.log,
+                            "got NEW_CONNECTION_ID when remote isn't using connection IDs"
+                        );
+                        return Err(TransportError::PROTOCOL_VIOLATION);
+                    }
+                    if self.params.stateless_reset_token.is_none() {
+                        // We're a server using the initial remote CID for the client, so let's
+                        // switch immediately to enable clientside stateless resets.
+                        debug_assert!(self.side.is_server());
+                        debug_assert_eq!(self.rem_cid_seq, 0);
+                        self.update_rem_cid(frame);
+                    } else {
+                        trace!(self.log, "ignoring NEW_CONNECTION_ID (unimplemented)");
+                    }
                 }
                 Frame::NewToken { .. } => {
                     trace!(self.log, "got new token");
@@ -1348,6 +1392,19 @@ impl Connection {
             }
         }
         Ok(false)
+    }
+
+    fn update_rem_cid(&mut self, new: frame::NewConnectionId) {
+        trace!(
+            self.log,
+            "switching to remote CID {sequence}: {connection_id}",
+            sequence = new.sequence,
+            connection_id = new.id
+        );
+        self.pending.retire_cids.push(self.rem_cid_seq);
+        self.rem_cid = new.id;
+        self.rem_cid_seq = new.sequence;
+        self.params.stateless_reset_token = Some(new.reset_token);
     }
 
     pub fn next_packet(&mut self, mux: &mut impl Multiplexer, now: u64) -> Option<Vec<u8>> {
@@ -1380,7 +1437,7 @@ impl Connection {
             {
                 trace!(self.log, "sending initial packet"; "pn" => number);
                 Header::Initial {
-                    src_cid: self.loc_cid,
+                    src_cid: *self.loc_cids.values().next().unwrap(),
                     dst_cid: self.rem_cid,
                     token: match self.state {
                         State::Handshake(ref state) => {
@@ -1394,7 +1451,7 @@ impl Connection {
                 trace!(self.log, "sending handshake packet"; "pn" => number);
                 Header::Long {
                     ty: LongType::Handshake,
-                    src_cid: self.loc_cid,
+                    src_cid: *self.loc_cids.values().next().unwrap(),
                     dst_cid: self.rem_cid,
                     number: PacketNumber::new(number, self.largest_acked_packet),
                 }
@@ -1611,6 +1668,35 @@ impl Connection {
             ));
         }
 
+        // NEW_CONNECTION_ID
+        while buf.len() + 44 < max_size {
+            let frame = if let Some(x) = pending.new_cids.pop() {
+                x
+            } else {
+                break;
+            };
+            trace!(
+                self.log,
+                "NEW_CONNECTION_ID {sequence}",
+                sequence = frame.sequence
+            );
+            frame.encode(&mut buf);
+            sent.new_cids.push(frame);
+        }
+
+        // RETIRE_CONNECTION_ID
+        while buf.len() + 9 < max_size {
+            let seq = if let Some(x) = pending.retire_cids.pop() {
+                x
+            } else {
+                break;
+            };
+            trace!(self.log, "RETIRE_CONNECTION_ID {sequence}", sequence = seq);
+            buf.write(frame::Type::RETIRE_CONNECTION_ID);
+            buf.write_var(seq);
+            sent.retire_cids.push(seq);
+        }
+
         // STREAM
         while buf.len() + 25 < max_size {
             let mut stream = if let Some(x) = pending.stream.pop_front() {
@@ -1737,7 +1823,7 @@ impl Connection {
             Header::Long {
                 ty: LongType::Handshake,
                 dst_cid: self.rem_cid,
-                src_cid: self.loc_cid,
+                src_cid: *self.loc_cids.values().next().unwrap(),
                 number,
             }
         };
@@ -2091,12 +2177,12 @@ impl Connection {
         self.side
     }
 
-    /// The `ConnectionId` used for this Connection locally
-    pub fn loc_cid(&self) -> ConnectionId {
-        self.loc_cid
+    /// The `ConnectionId`s defined for this Connection locally.
+    pub fn loc_cids(&self) -> impl Iterator<Item = &ConnectionId> {
+        self.loc_cids.values()
     }
 
-    /// The `ConnectionId` used for this Connection by the peer
+    /// The `ConnectionId` defined for this Connection by the peer.
     pub fn rem_cid(&self) -> ConnectionId {
         self.rem_cid
     }
@@ -2261,6 +2347,8 @@ pub struct Retransmits {
     stop_sending: Vec<(StreamId, u16)>,
     max_stream_data: FnvHashSet<StreamId>,
     crypto: VecDeque<frame::Crypto>,
+    new_cids: Vec<frame::NewConnectionId>,
+    retire_cids: Vec<u64>,
 }
 
 impl Retransmits {
@@ -2276,6 +2364,8 @@ impl Retransmits {
             && self.stop_sending.is_empty()
             && self.max_stream_data.is_empty()
             && self.crypto.is_empty()
+            && self.new_cids.is_empty()
+            && self.retire_cids.is_empty()
     }
 
     pub fn path_challenge(&mut self, packet: u64, token: u64) {
@@ -2305,6 +2395,8 @@ impl Default for Retransmits {
             stop_sending: Vec::new(),
             max_stream_data: FnvHashSet::default(),
             crypto: VecDeque::new(),
+            new_cids: Vec::new(),
+            retire_cids: Vec::new(),
         }
     }
 }
@@ -2528,6 +2620,7 @@ impl From<ConnectionHandle> for usize {
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
 const MAX_ACK_BLOCKS: usize = 64;
 
+/// Interface from a `Connection` to the associated QUIC endpoint.
 pub trait Multiplexer {
     /// Transmit a UDP packet.
     fn transmit(&mut self, destination: SocketAddrV6, packet: Box<[u8]>);
@@ -2537,4 +2630,8 @@ pub trait Multiplexer {
     fn timer_stop(&mut self, timer: Timer);
     /// Emit an application-facing event.
     fn emit(&mut self, event: Event);
+    /// Obtain a new local connection ID to supply to the peer.
+    fn new_cid(&mut self) -> ConnectionId;
+    /// Retire an old local connection ID at the peer's request.
+    fn retire_cid(&mut self, cid: &ConnectionId);
 }

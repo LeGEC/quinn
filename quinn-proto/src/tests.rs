@@ -447,41 +447,71 @@ fn stateless_retry() {
 }
 
 #[test]
-fn stateless_reset() {
-    let mut server = Config::default();
-    server.max_remote_uni_streams = 32;
-    server.max_remote_bi_streams = 32;
-
-    let mut token_value = [0; 64];
+fn server_stateless_reset() {
     let mut reset_value = [0; 64];
     let mut rng = rand::thread_rng();
-    rng.fill_bytes(&mut token_value);
     rng.fill_bytes(&mut reset_value);
 
-    let listen_key = ServerConfig {
-        token_key: TokenKey::new(&token_value),
-        reset_key: SigningKey::new(&digest::SHA512_256, &reset_value),
-        ..server_config()
+    let reset_key = SigningKey::new(&digest::SHA512_256, &reset_value);
+    let reset_key_2 = SigningKey::new(&digest::SHA512_256, &reset_value);
+
+    let server = Config {
+        reset_key,
+        max_remote_uni_streams: 32,
+        max_remote_bi_streams: 32,
+        ..Config::default()
     };
 
-    let pair_listen_keys = ServerConfig {
-        token_key: TokenKey::new(&token_value),
-        reset_key: SigningKey::new(&digest::SHA512_256, &reset_value),
-        ..server_config()
-    };
-
-    let mut pair = Pair::new(server, Default::default(), listen_key);
+    let mut pair = Pair::new(server, Config::default(), server_config());
     let (client_conn, _) = pair.connect();
     pair.server.endpoint = Endpoint::new(
         pair.log.new(o!("peer" => "server")),
-        Config::default(),
-        Some(pair_listen_keys),
+        Config {
+            reset_key: reset_key_2,
+            ..Config::default()
+        },
+        Some(server_config()),
     )
     .unwrap();
-    pair.client.ping(client_conn);
+    // Send something big enough to allow room for a smaller stateless reset.
+    pair.client
+        .close(pair.time, client_conn, 42, (&[0xab; 128][..]).into());
     info!(pair.log, "resetting");
     pair.drive();
     assert_matches!(pair.client.poll(), Some((conn, Event::ConnectionLost { reason: ConnectionError::Reset })) if conn == client_conn);
+}
+
+#[test]
+fn client_stateless_reset() {
+    let mut reset_value = [0; 64];
+    let mut rng = rand::thread_rng();
+    rng.fill_bytes(&mut reset_value);
+
+    let reset_key = SigningKey::new(&digest::SHA512_256, &reset_value);
+    let reset_key_2 = SigningKey::new(&digest::SHA512_256, &reset_value);
+
+    let client = Config {
+        reset_key,
+        ..Config::default()
+    };
+
+    let mut pair = Pair::new(Config::default(), client, server_config());
+    let (_, server_conn) = pair.connect();
+    pair.client.endpoint = Endpoint::new(
+        pair.log.new(o!("side" => "Client")),
+        Config {
+            reset_key: reset_key_2,
+            ..Config::default()
+        },
+        Some(server_config()),
+    )
+    .unwrap();
+    // Send something big enough to allow room for a smaller stateless reset.
+    pair.server
+        .close(pair.time, server_conn, 42, (&[0xab; 128][..]).into());
+    info!(pair.log, "resetting");
+    pair.drive();
+    assert_matches!(pair.server.poll(), Some((conn, Event::ConnectionLost { reason: ConnectionError::Reset })) if conn == server_conn);
 }
 
 #[test]

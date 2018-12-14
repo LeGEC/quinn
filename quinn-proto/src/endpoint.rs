@@ -1,4 +1,3 @@
-use std::cmp;
 use std::collections::VecDeque;
 use std::net::SocketAddrV6;
 use std::sync::Arc;
@@ -18,10 +17,7 @@ use crate::connection::{
     State,
 };
 use crate::crypto::{self, reset_token_for, ConnectError, Crypto, TlsSession, TokenKey};
-use crate::packet::{
-    ConnectionId, Header, Packet, PacketDecodeError, PacketNumber, PartialDecode,
-    PACKET_NUMBER_32_MASK,
-};
+use crate::packet::{ConnectionId, Header, Packet, PacketDecodeError, PartialDecode};
 use crate::stream::{ReadError, WriteError};
 use crate::transport_parameters::TransportParameters;
 use crate::{
@@ -90,6 +86,12 @@ pub struct Config {
     /// constrains the amount of simultaneous connections the endpoint can maintain. The API user is
     /// responsible for making sure that the pool is large enough to cover the intended usage.
     pub local_cid_len: usize,
+
+    /// Private key used to send authenticated connection resets to peers who were communicating
+    /// with a previous instance of this endpoint.
+    ///
+    /// Must be persisted across restarts to be useful.
+    pub reset_key: SigningKey,
 }
 
 impl Default for Config {
@@ -99,6 +101,10 @@ impl Default for Config {
                                                         // Window size needed to avoid pipeline
                                                         // stalls
         const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT;
+
+        let mut reset_value = [0; 64];
+        rand::thread_rng().fill_bytes(&mut reset_value);
+
         Self {
             max_remote_bi_streams: 0,
             max_remote_uni_streams: 0,
@@ -121,6 +127,7 @@ impl Default for Config {
             loss_reduction_factor: 0x8000, // 1/2
 
             local_cid_len: 8,
+            reset_key: SigningKey::new(&digest::SHA512_256, &reset_value),
         }
     }
 }
@@ -132,22 +139,34 @@ impl Default for Config {
 /// `handle` and `timeout`.
 pub struct Endpoint {
     log: Logger,
-    rng: OsRng,
     ctx: Context,
     connection_ids_initial: FnvHashMap<ConnectionId, ConnectionHandle>,
-    connection_ids: FnvHashMap<ConnectionId, ConnectionHandle>,
     connection_remotes: FnvHashMap<SocketAddrV6, ConnectionHandle>,
     pub(crate) connections: Slab<Connection>,
-    config: Arc<Config>,
     server_config: Option<ServerConfig>,
     dirty_conns: FnvHashSet<ConnectionHandle>,
     incoming_handshakes: usize,
 }
 
 struct Context {
+    config: Arc<Config>,
+    rng: OsRng,
     io: VecDeque<Io>,
     events: VecDeque<(ConnectionHandle, Event)>,
     incoming: VecDeque<ConnectionHandle>,
+    connection_ids: FnvHashMap<ConnectionId, ConnectionHandle>,
+}
+
+impl Context {
+    fn new_cid(&mut self) -> ConnectionId {
+        loop {
+            let cid = ConnectionId::random(&mut self.rng, self.config.local_cid_len);
+            if !self.connection_ids.contains_key(&cid) {
+                break cid;
+            }
+            assert!(self.config.local_cid_len > 0);
+        }
+    }
 }
 
 /// Parameters governing incoming connections.
@@ -166,11 +185,6 @@ pub struct ServerConfig {
     /// Microseconds after a stateless retry token was issued for which it's considered valid.
     pub retry_token_lifetime: u64,
 
-    /// Private key used to send authenticated connection resets to clients who were communicating
-    /// with a previous instance of this endpoint.
-    ///
-    /// Must be persisted across restarts to be useful.
-    pub reset_key: SigningKey,
     /// Maximum number of incoming connections to buffer.
     ///
     /// Calling `Endpoint::accept` removes a connection from the buffer, so this does not need to
@@ -183,9 +197,7 @@ impl Default for ServerConfig {
         let rng = &mut rand::thread_rng();
 
         let mut token_value = [0; 64];
-        let mut reset_value = [0; 64];
         rng.fill_bytes(&mut token_value);
-        rng.fill_bytes(&mut reset_value);
 
         Self {
             tls_config: Arc::new(crypto::build_server_config()),
@@ -194,7 +206,6 @@ impl Default for ServerConfig {
             use_stateless_retry: false,
             retry_token_lifetime: 15_000_000,
 
-            reset_key: SigningKey::new(&digest::SHA512_256, &reset_value),
             accept_buffer: 1024,
         }
     }
@@ -226,20 +237,20 @@ impl Endpoint {
         );
         Ok(Self {
             ctx: Context {
+                config,
+                rng,
                 io: VecDeque::new(),
                 // session_ticket_buffer,
                 events: VecDeque::new(),
                 incoming: VecDeque::new(),
+                connection_ids: FnvHashMap::default(),
             },
             log,
-            rng,
             connection_ids_initial: FnvHashMap::default(),
-            connection_ids: FnvHashMap::default(),
             connection_remotes: FnvHashMap::default(),
             connections: Slab::new(),
             dirty_conns: FnvHashSet::default(),
             incoming_handshakes: 0,
-            config,
             server_config,
         })
     }
@@ -271,7 +282,7 @@ impl Endpoint {
     pub fn handle(&mut self, now: u64, remote: SocketAddrV6, mut data: BytesMut) {
         let datagram_len = data.len();
         while !data.is_empty() {
-            match PartialDecode::new(data, self.config.local_cid_len) {
+            match PartialDecode::new(data, self.ctx.config.local_cid_len) {
                 Ok(partial_decode) => {
                     match self.handle_decode(now, remote, partial_decode, datagram_len) {
                         Some(rest) => {
@@ -294,7 +305,7 @@ impl Endpoint {
                     // Negotiate versions
                     let mut buf = Vec::<u8>::new();
                     Header::VersionNegotiate {
-                        random: self.rng.gen(),
+                        random: self.ctx.rng.gen(),
                         src_cid: destination,
                         dst_cid: source,
                     }
@@ -328,8 +339,8 @@ impl Endpoint {
 
         let dst_cid = partial_decode.dst_cid();
         let conn = {
-            let conn = if self.config.local_cid_len > 0 {
-                self.connection_ids.get(&dst_cid)
+            let conn = if self.ctx.config.local_cid_len > 0 {
+                self.ctx.connection_ids.get(&dst_cid)
             } else {
                 None
             };
@@ -356,9 +367,10 @@ impl Endpoint {
         if !self.is_server() {
             debug!(
                 self.log,
-                "dropping packet on unrecognized connection {connection} because this endpoint is not a server",
+                "got unexpected packet on unrecognized connection {connection}",
                 connection = dst_cid
             );
+            self.stateless_reset(datagram_len, remote, &dst_cid);
             return None;
         }
 
@@ -400,45 +412,49 @@ impl Endpoint {
         //
 
         if !dst_cid.is_empty() {
-            debug!(self.log, "sending stateless reset");
-            let mut buf = Vec::<u8>::new();
-            // Bound padding size to at most 8 bytes larger than input to mitigate amplification
-            // attacks
-            let header_len = 1 + MAX_CID_SIZE + 1;
-            let padding = self.rng.gen_range(
-                0,
-                cmp::max(
-                    RESET_TOKEN_SIZE + 8,
-                    datagram_len.saturating_sub(header_len),
-                )
-                .saturating_sub(RESET_TOKEN_SIZE),
-            );
-            buf.reserve_exact(header_len + padding + RESET_TOKEN_SIZE);
-            let number = self.rng.gen::<u32>() & PACKET_NUMBER_32_MASK | 0x4000;
-            Header::Short {
-                dst_cid: ConnectionId::random(&mut self.rng, MAX_CID_SIZE),
-                number: PacketNumber::U32(number),
-                key_phase: false,
-            }
-            .encode(&mut buf);
-
-            let padding_start = buf.len();
-            buf.resize(padding_start + padding, 0);
-            self.rng
-                .fill_bytes(&mut buf[padding_start..padding_start + padding]);
-            buf.extend(&reset_token_for(
-                &self.server_config.as_ref().unwrap().reset_key,
-                &dst_cid,
-            ));
-
-            self.ctx.io.push_back(Io::Transmit {
-                destination: remote,
-                packet: buf.into(),
-            });
+            self.stateless_reset(datagram_len, remote, &dst_cid);
         } else {
             trace!(self.log, "dropping unrecognized short packet without ID");
         }
         None
+    }
+
+    fn stateless_reset(
+        &mut self,
+        inciting_packet_len: usize,
+        remote: SocketAddrV6,
+        dst_cid: &ConnectionId,
+    ) {
+        /// Minimum amount of padding for the stateless reset to look like a short-header packet
+        const MIN_PADDING_LEN: usize = 20;
+        /// Minimum total length for a stateless reset packet
+        const MIN_LEN: usize = 1 + MIN_PADDING_LEN + RESET_TOKEN_SIZE;
+
+        // Prevent amplification attacks and reset loops
+        if inciting_packet_len <= MIN_LEN {
+            debug!(self.log, "ignoring unexpected {len} byte packet: not larger than minimum stateless reset size", len=inciting_packet_len);
+            return;
+        }
+
+        debug!(self.log, "sending stateless reset");
+        let mut buf = Vec::<u8>::new();
+        let padding_len = self.ctx.rng.gen_range(
+            MIN_PADDING_LEN,
+            // Padded packet must be smaller than the inciting packet
+            inciting_packet_len - (MIN_LEN - MIN_PADDING_LEN),
+        );
+        buf.reserve_exact(1 + padding_len + RESET_TOKEN_SIZE);
+        buf.resize(1 + padding_len, 0);
+        buf[0] = 0b00110000; // Changes in draft 17
+        self.ctx.rng.fill_bytes(&mut buf[1..padding_len + 1]);
+        buf.extend(&reset_token_for(&self.ctx.config.reset_key, dst_cid));
+
+        debug_assert!(buf.len() < inciting_packet_len);
+
+        self.ctx.io.push_back(Io::Transmit {
+            destination: remote,
+            packet: buf.into(),
+        });
     }
 
     /// Initiate a connection
@@ -448,8 +464,8 @@ impl Endpoint {
         config: &Arc<crypto::ClientConfig>,
         server_name: &str,
     ) -> Result<ConnectionHandle, ConnectError> {
-        let local_id = self.new_cid();
-        let remote_id = ConnectionId::random(&mut self.rng, MAX_CID_SIZE);
+        let local_id = self.ctx.new_cid();
+        let remote_id = ConnectionId::random(&mut self.ctx.rng, MAX_CID_SIZE);
         trace!(self.log, "initial dcid"; "value" => %remote_id);
         let conn = self.add_connection(
             remote_id,
@@ -463,16 +479,6 @@ impl Endpoint {
         )?;
         self.dirty_conns.insert(conn);
         Ok(conn)
-    }
-
-    fn new_cid(&mut self) -> ConnectionId {
-        loop {
-            let cid = ConnectionId::random(&mut self.rng, self.config.local_cid_len);
-            if !self.connection_ids.contains_key(&cid) {
-                break cid;
-            }
-            assert!(self.config.local_cid_len > 0);
-        }
     }
 
     fn add_connection(
@@ -489,18 +495,18 @@ impl Endpoint {
                 TlsSession::new_client(
                     &config.tls_config,
                     &config.server_name,
-                    &TransportParameters::new(&self.config),
+                    &TransportParameters::new(&self.ctx.config),
                 )?,
                 Some(config),
             ),
             ConnectionOpts::Server { orig_dst_cid } => {
                 let server_params = TransportParameters {
                     stateless_reset_token: Some(reset_token_for(
-                        &self.server_config.as_ref().unwrap().reset_key,
+                        &self.ctx.config.reset_key,
                         &local_id,
                     )),
                     original_connection_id: orig_dst_cid,
-                    ..TransportParameters::new(&self.config)
+                    ..TransportParameters::new(&self.ctx.config)
                 };
                 (
                     TlsSession::new_server(
@@ -514,7 +520,7 @@ impl Endpoint {
 
         let conn = self.connections.insert(Connection::new(
             self.log.new(o!("connection" => local_id)),
-            Arc::clone(&self.config),
+            Arc::clone(&self.ctx.config),
             initial_id,
             local_id,
             remote_id,
@@ -524,8 +530,8 @@ impl Endpoint {
         ));
         let conn = ConnectionHandle(conn);
 
-        if self.config.local_cid_len > 0 {
-            self.connection_ids.insert(local_id, conn);
+        if self.ctx.config.local_cid_len > 0 {
+            self.ctx.connection_ids.insert(local_id, conn);
         }
         self.connection_remotes.insert(remote, conn);
         Ok(conn)
@@ -555,7 +561,7 @@ impl Endpoint {
             debug!(self.log, "failed to authenticate initial packet");
             return;
         };
-        let loc_cid = self.new_cid();
+        let loc_cid = self.ctx.new_cid();
 
         if self.ctx.incoming.len() + self.incoming_handshakes
             == self.server_config.as_ref().unwrap().accept_buffer as usize
@@ -658,9 +664,10 @@ impl Endpoint {
             self.connection_ids_initial
                 .remove(&self.connections[conn.0].init_cid);
         }
-        if self.config.local_cid_len > 0 {
-            self.connection_ids
-                .remove(&self.connections[conn.0].loc_cid());
+        if self.ctx.config.local_cid_len > 0 {
+            for cid in self.connections[conn.0].loc_cids() {
+                self.ctx.connection_ids.remove(cid);
+            }
         }
         self.connection_remotes
             .remove(&self.connections[conn.0].remote);
@@ -962,5 +969,13 @@ impl Multiplexer for EndpointMux<'_> {
         } else {
             self.ctx.events.push_back((self.handle, event));
         }
+    }
+    fn new_cid(&mut self) -> ConnectionId {
+        let cid = self.ctx.new_cid();
+        self.ctx.connection_ids.insert(cid, self.handle);
+        cid
+    }
+    fn retire_cid(&mut self, cid: &ConnectionId) {
+        self.ctx.connection_ids.remove(&cid);
     }
 }

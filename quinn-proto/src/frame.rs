@@ -141,11 +141,7 @@ pub enum Frame {
     Stream(Stream),
     PathChallenge(u64),
     PathResponse(u64),
-    NewConnectionId {
-        sequence: u64,
-        id: ConnectionId,
-        reset_token: [u8; 16],
-    },
+    NewConnectionId(NewConnectionId),
     Crypto(Crypto),
     NewToken {
         token: Bytes,
@@ -524,11 +520,11 @@ impl Iter {
                 }
                 let mut reset_token = [0; RESET_TOKEN_SIZE];
                 self.bytes.copy_to_slice(&mut reset_token);
-                Frame::NewConnectionId {
+                Frame::NewConnectionId(NewConnectionId {
                     sequence,
                     id,
                     reset_token,
-                }
+                })
             }
             Type::CRYPTO => Frame::Crypto(Crypto {
                 offset: self.bytes.get_var()?,
@@ -633,6 +629,23 @@ impl RstStream {
         varint::write(self.id.0, out).unwrap();
         out.write(self.error_code);
         varint::write(self.final_offset, out).unwrap();
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct NewConnectionId {
+    pub sequence: u64,
+    pub id: ConnectionId,
+    pub reset_token: [u8; 16],
+}
+
+impl NewConnectionId {
+    pub fn encode<W: BufMut>(&self, out: &mut W) {
+        out.write(Type::NEW_CONNECTION_ID);
+        out.write_var(self.sequence);
+        out.write(self.id.len() as u8);
+        out.put_slice(&self.id);
+        out.put_slice(&self.reset_token);
     }
 }
 
